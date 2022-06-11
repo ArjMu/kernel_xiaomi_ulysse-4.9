@@ -1,4 +1,5 @@
-/* Copyright (c) 2008-2021, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2008-2020, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2022 Qualcomm Innovation Center, Inc. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -266,6 +267,7 @@ kgsl_mem_entry_create(void)
 		atomic_set(&entry->map_count, 0);
 	}
 
+	atomic_set(&entry->map_count, 0);
 	return entry;
 }
 #ifdef CONFIG_DMA_SHARED_BUFFER
@@ -894,7 +896,7 @@ struct kgsl_process_private *kgsl_process_private_find(pid_t pid)
 {
 	struct kgsl_process_private *p, *private = NULL;
 
-	mutex_lock(&kgsl_driver.process_mutex);
+	spin_lock(&kgsl_driver.proclist_lock);
 	list_for_each_entry(p, &kgsl_driver.process_list, list) {
 		if (pid_nr(p->pid) == pid) {
 			if (kgsl_process_private_get(p))
@@ -902,7 +904,7 @@ struct kgsl_process_private *kgsl_process_private_find(pid_t pid)
 			break;
 		}
 	}
-	mutex_unlock(&kgsl_driver.process_mutex);
+	spin_unlock(&kgsl_driver.proclist_lock);
 	return private;
 }
 
@@ -1019,18 +1021,19 @@ static void kgsl_process_private_close(struct kgsl_device_private *dev_priv,
 		kgsl_mmu_detach_pagetable(private->pagetable);
 
 	/* Remove the process struct from the master list */
+	spin_lock(&kgsl_driver.proclist_lock);
 	list_del(&private->list);
+	spin_unlock(&kgsl_driver.proclist_lock);
+
+	debugfs_remove_recursive(private->debug_root);
 
 	/*
-	 * Unlock the mutex before releasing the memory and the debugfs
-	 * nodes - this prevents deadlocks with the IOMMU and debugfs
-	 * locks.
+	 * Unlock the mutex before releasing the memory - this prevents a
+	 * deadlock with the IOMMU mutex if a page fault occurs.
 	 */
 	mutex_unlock(&kgsl_driver.process_mutex);
 
 	process_release_memory(private);
-	debugfs_remove_recursive(private->debug_root);
-
 	kgsl_process_private_put(private);
 }
 
@@ -1055,7 +1058,9 @@ static struct kgsl_process_private *kgsl_process_private_open(
 		kgsl_process_init_sysfs(device, private);
 		kgsl_process_init_debugfs(private);
 
+		spin_lock(&kgsl_driver.proclist_lock);
 		list_add(&private->list, &kgsl_driver.process_list);
+		spin_unlock(&kgsl_driver.proclist_lock);
 	}
 
 done:
@@ -1256,7 +1261,7 @@ kgsl_sharedmem_find(struct kgsl_process_private *private, uint64_t gpuaddr)
 	if (!private)
 		return NULL;
 
-	if (!kgsl_mmu_gpuaddr_in_range(private->pagetable, gpuaddr))
+	if (!kgsl_mmu_gpuaddr_in_range(private->pagetable, gpuaddr, 0))
 		return NULL;
 
 	spin_lock(&private->mem_lock);
@@ -2179,6 +2184,15 @@ static int memdesc_sg_virt(struct kgsl_memdesc *memdesc, unsigned long useraddr)
 
 	ret = sg_alloc_table_from_pages(memdesc->sgt, pages, npages,
 					0, memdesc->size, GFP_KERNEL);
+
+	if (ret)
+		goto out;
+
+	ret = kgsl_cache_range_op(memdesc, 0, memdesc->size,
+			KGSL_CACHE_OP_FLUSH);
+
+	if (ret)
+		sg_free_table(memdesc->sgt);
 out:
 	if (ret) {
 		for (i = 0; i < npages; i++)
@@ -2233,15 +2247,6 @@ static int kgsl_setup_anon_useraddr(struct kgsl_pagetable *pagetable,
 }
 
 #ifdef CONFIG_DMA_SHARED_BUFFER
-static int match_file(const void *p, struct file *file, unsigned int fd)
-{
-	/*
-	 * We must return fd + 1 because iterate_fd stops searching on
-	 * non-zero return, but 0 is a valid fd.
-	 */
-	return (p == file) ? (fd + 1) : 0;
-}
-
 static void _setup_cache_mode(struct kgsl_mem_entry *entry,
 		struct vm_area_struct *vma)
 {
@@ -2279,8 +2284,6 @@ static int kgsl_setup_dmabuf_useraddr(struct kgsl_device *device,
 	vma = find_vma(current->mm, hostptr);
 
 	if (vma && vma->vm_file) {
-		int fd;
-
 		ret = check_vma_flags(vma, entry->memdesc.flags);
 		if (ret) {
 			up_read(&current->mm->mmap_sem);
@@ -2296,10 +2299,13 @@ static int kgsl_setup_dmabuf_useraddr(struct kgsl_device *device,
 			return -EFAULT;
 		}
 
-		/* Look for the fd that matches this the vma file */
-		fd = iterate_fd(current->files, 0, match_file, vma->vm_file);
-		if (fd != 0)
-			dmabuf = dma_buf_get(fd - 1);
+		/*
+		 * Take a refcount because dma_buf_put() decrements the
+		 * refcount
+		 */
+		get_file(vma->vm_file);
+
+		dmabuf = vma->vm_file->private_data;
 	}
 
 	if (IS_ERR_OR_NULL(dmabuf)) {
@@ -4638,6 +4644,7 @@ static const struct file_operations kgsl_fops = {
 
 struct kgsl_driver kgsl_driver  = {
 	.process_mutex = __MUTEX_INITIALIZER(kgsl_driver.process_mutex),
+	.proclist_lock = __SPIN_LOCK_UNLOCKED(kgsl_driver.proclist_lock),
 	.ptlock = __SPIN_LOCK_UNLOCKED(kgsl_driver.ptlock),
 	.devlock = __MUTEX_INITIALIZER(kgsl_driver.devlock),
 	/*

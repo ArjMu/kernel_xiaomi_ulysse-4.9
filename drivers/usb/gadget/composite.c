@@ -1867,8 +1867,10 @@ composite_setup(struct usb_gadget *gadget, const struct usb_ctrlrequest *ctrl)
 				value = min(w_length, (u16) value);
 			break;
 		case USB_DT_STRING:
+			spin_lock(&cdev->lock);
 			value = get_string(cdev, req->buf,
 					w_index, w_value & 0xff);
+			spin_unlock(&cdev->lock);
 			if (value >= 0)
 				value = min(w_length, (u16) value);
 			break;
@@ -2101,6 +2103,9 @@ unknown:
 				if (w_index != 0x5 || (w_value >> 8))
 					break;
 				interface = w_value & 0xFF;
+				if (interface >= MAX_CONFIG_INTERFACES ||
+				    !os_desc_cfg->interface[interface])
+					break;
 				buf[6] = w_index;
 				if (w_length == 0x0A) {
 					count = count_ext_prop(os_desc_cfg,
@@ -2382,7 +2387,8 @@ int composite_dev_prepare(struct usb_composite_driver *composite,
 	if (!cdev->req)
 		return -ENOMEM;
 
-	cdev->req->buf = kzalloc(USB_COMP_EP0_BUFSIZ, GFP_KERNEL);
+	cdev->req->buf = kzalloc(USB_COMP_EP0_BUFSIZ +
+				(gadget->extra_buf_alloc), GFP_KERNEL);
 	if (!cdev->req->buf)
 		goto fail;
 
@@ -2562,7 +2568,7 @@ void composite_resume(struct usb_gadget *gadget)
 	 * suspend/resume callbacks?
 	 */
 	INFO(cdev, "USB Resume end\n");
-	place_marker("M - USB device is resumed");
+	update_marker("M - USB device is resumed");
 	if (cdev->driver->resume)
 		cdev->driver->resume(cdev);
 
